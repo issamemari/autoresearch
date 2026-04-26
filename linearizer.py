@@ -156,12 +156,9 @@ def dpd_fn(x):
 
 results = evaluate_dpd(dpd_fn)
 
-# Also get PA-only NMSE on validation
+# Generate diagnostic plots (PSD/ACPR, AM/AM, AM/PM, constellation)
 x_val, _ = load_data("val")
 y_val_nodpd = pa_model(x_val)
-nmse_no_dpd_val = compute_nmse_db(y_val_nodpd, x_val)
-
-# Generate diagnostic plots (PSD/ACPR, AM/AM, AM/PM, constellation)
 x_dpd_val = dpd_fn(x_val)
 y_val_dpd = pa_model(x_dpd_val)
 plot_diagnostics(x_val, y_val_nodpd, y_val_dpd, "diagnostics.png")
@@ -172,14 +169,17 @@ t_end = time.time()
 # Output summary
 # ---------------------------------------------------------------------------
 
+nmse_improvement = results['nmse_no_dpd_db'] - results['nmse_db']
+
 print()
 print("---")
 print(f"nmse_db:          {results['nmse_db']:.2f}")
-print(f"nmse_no_dpd_db:   {nmse_no_dpd_val:.2f}")
-print(f"nmse_improvement: {nmse_no_dpd_val - results['nmse_db']:.2f}")
+print(f"nmse_no_dpd_db:   {results['nmse_no_dpd_db']:.2f}")
+print(f"nmse_improvement: {nmse_improvement:.2f}")
 print(f"acpr_before_dbc:  {results['acpr_before_dbc']:.2f}")
 print(f"acpr_after_dbc:   {results['acpr_after_dbc']:.2f}")
-print(f"evm_percent:      {results['evm_percent']:.2f}")
+print(f"evm_before_pct:   {results['evm_before_percent']:.2f}")
+print(f"evm_after_pct:    {results['evm_percent']:.2f}")
 print(f"poly_order:       {POLY_ORDER}")
 print(f"memory_depth:     {MEMORY_DEPTH}")
 print(f"num_coefficients: {num_coefficients}")

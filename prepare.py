@@ -253,8 +253,10 @@ def evaluate_dpd(dpd_fn):
 
     return {
         "nmse_db": compute_nmse_db(y_with_dpd, x_val),
+        "nmse_no_dpd_db": compute_nmse_db(y_no_dpd, x_val),
         "acpr_before_dbc": compute_acpr_db(y_no_dpd),
         "acpr_after_dbc": compute_acpr_db(y_with_dpd),
+        "evm_before_percent": compute_evm_percent(y_no_dpd, x_val),
         "evm_percent": compute_evm_percent(y_with_dpd, x_val),
     }
 
