@@ -25,7 +25,7 @@ CROSS_MEMORY = 2
 CROSS_LAG = 2
 NUM_ITERATIONS = 1
 REGULARIZATION = 1e-6
-DPD_FILTER_BW = 5.0     # DPD output filter bandwidth as multiple of signal BW
+DPD_FILTER_BW = 0       # 0 = no DPD output filtering
 
 # ---------------------------------------------------------------------------
 # GMP Basis Matrix

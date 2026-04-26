@@ -150,17 +150,14 @@ def generate_ofdm_signal(num_samples, seed):
 
     signal = np.concatenate(samples)[:num_samples]
 
-    # Band-limit the signal with a raised-cosine filter to suppress spectral
-    # leakage from OFDM rectangular windowing. Without this, the input signal
-    # itself has poor ACPR (~-25 dBc), setting a floor no DPD can beat.
-    from scipy.signal import firwin, lfilter
-    num_taps = 201
+    # Band-limit the signal to suppress spectral leakage from OFDM
+    # rectangular windowing. Uses zero-phase FIR filtering (filtfilt)
+    # with a high-order Blackman-Harris window for deep stopband rejection.
+    from scipy.signal import firwin, filtfilt
+    num_taps = 401
     cutoff = SIGNAL_BANDWIDTH / SAMPLE_RATE  # normalized cutoff
     filt = firwin(num_taps, cutoff, window='blackmanharris')
-    # Apply zero-phase filtering (forward + backward) to avoid group delay
-    signal = lfilter(filt, 1.0, signal)
-    # Trim transient
-    signal = signal[num_taps:]
+    signal = filtfilt(filt, 1.0, signal)
     signal = signal[:num_samples]
 
     # Normalize to target RMS for ~6 dB input back-off
