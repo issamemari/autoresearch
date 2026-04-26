@@ -20,52 +20,78 @@ from prepare import (
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
-# DPD model structure
+# DPD model structure (GMP: Generalized Memory Polynomial)
 POLY_ORDER = 7          # maximum polynomial order (odd orders: 1, 3, 5, 7)
-MEMORY_DEPTH = 3        # number of memory taps (0 = memoryless DPD)
+MEMORY_DEPTH = 3        # aligned memory depth
+CROSS_ORDER = 5         # cross-term polynomial order (odd: 3, 5)
+CROSS_MEMORY = 2        # cross-term memory depth
+CROSS_LAG = 2           # max envelope lag for cross-terms
 
 # Estimation
 NUM_ITERATIONS = 1      # indirect learning architecture iterations
 REGULARIZATION = 1e-6   # ridge regularization for least squares
 
 # ---------------------------------------------------------------------------
-# DPD Model: Memory Polynomial
+# DPD Model: Generalized Memory Polynomial (GMP)
 # ---------------------------------------------------------------------------
-# y(n) = sum_{k=0}^{K-1} sum_{m=0}^{M} w_{k,m} * x(n-m) * |x(n-m)|^{2k}
+# Aligned terms:  x(n-m) * |x(n-m)|^{2k}
+# Lagging cross:  x(n-m) * |x(n-m-l)|^{2k}  (envelope from past samples)
+# Leading cross:  x(n-m) * |x(n-m+l)|^{2k}  (envelope from future samples)
 #
-# K = (POLY_ORDER + 1) / 2 polynomial terms (odd orders only)
-# M = MEMORY_DEPTH memory taps
-# Total coefficients: K * (M + 1)
+# The cross-terms capture signal-envelope interactions that a standard
+# memory polynomial misses — critical for Wiener-type PAs.
 
-def build_basis_matrix(x, K, M):
+def build_gmp_basis_matrix(x, K_a, M_a, K_c, M_c, L_c):
     """
-    Build the memory polynomial basis matrix.
-
-    Each column is one basis function: x(n-m) * |x(n-m)|^{2k}
-    for k = 0, ..., K-1 and m = 0, ..., M.
+    Build the GMP basis matrix with aligned + lagging + leading cross-terms.
 
     Args:
         x: complex input signal (length N)
-        K: number of polynomial terms
-        M: memory depth
+        K_a: aligned polynomial terms (orders 1, 3, ..., 2*K_a-1)
+        M_a: aligned memory depth
+        K_c: cross-term polynomial terms (orders 3, 5, ..., 2*K_c+1)
+        M_c: cross-term memory depth
+        L_c: max cross-term envelope lag/lead
     Returns:
-        U: basis matrix of shape (N, K*(M+1))
+        U: basis matrix
     """
     N = len(x)
-    x_pad = np.concatenate([np.zeros(M, dtype=np.complex128), x])
+    pad = max(M_a, M_c + L_c)
+    x_pad = np.concatenate([np.zeros(pad, dtype=np.complex128), x,
+                            np.zeros(L_c, dtype=np.complex128)])
 
     columns = []
-    for k in range(K):
-        for m in range(M + 1):
-            x_del = x_pad[M - m : N + M - m]
+
+    # Aligned terms: x(n-m) * |x(n-m)|^{2k}
+    for k in range(K_a):
+        for m in range(M_a + 1):
+            x_del = x_pad[pad - m : N + pad - m]
             columns.append(x_del * np.abs(x_del) ** (2 * k))
+
+    # Lagging cross-terms: x(n-m) * |x(n-m-l)|^{2k}  for l >= 1
+    for k in range(1, K_c + 1):
+        for m in range(M_c + 1):
+            for l in range(1, L_c + 1):
+                x_sig = x_pad[pad - m : N + pad - m]
+                x_env = x_pad[pad - m - l : N + pad - m - l]
+                columns.append(x_sig * np.abs(x_env) ** (2 * k))
+
+    # Leading cross-terms: x(n-m) * |x(n-m+l)|^{2k}  for l >= 1
+    for k in range(1, K_c + 1):
+        for m in range(M_c + 1):
+            for l in range(1, L_c + 1):
+                x_sig = x_pad[pad - m : N + pad - m]
+                x_env = x_pad[pad - m + l : N + pad - m + l]
+                columns.append(x_sig * np.abs(x_env) ** (2 * k))
 
     return np.column_stack(columns)
 
 
-def apply_dpd(x, coefficients, K, M):
-    """Apply DPD with the given coefficients to input signal x."""
-    U = build_basis_matrix(x, K, M)
+def apply_dpd(x, coefficients):
+    """Apply GMP DPD with the given coefficients to input signal x."""
+    K_a = (POLY_ORDER + 1) // 2
+    K_c = (CROSS_ORDER - 1) // 2
+    U = build_gmp_basis_matrix(x, K_a, MEMORY_DEPTH, K_c, CROSS_MEMORY, CROSS_LAG)
     return U @ coefficients
 
 # ---------------------------------------------------------------------------
@@ -87,26 +113,18 @@ print(f"PA linear gain: {abs(pa_gain):.4f} (phase: {np.degrees(np.angle(pa_gain)
 nmse_no_dpd = compute_nmse_db(y_train, x_train)
 print(f"PA NMSE (no DPD): {nmse_no_dpd:.2f} dB")
 
-K = (POLY_ORDER + 1) // 2  # number of polynomial terms
-num_coefficients = K * (MEMORY_DEPTH + 1)
-print(f"DPD model: order={POLY_ORDER}, memory={MEMORY_DEPTH}, "
-      f"coefficients={num_coefficients}")
+K_a = (POLY_ORDER + 1) // 2
+K_c = (CROSS_ORDER - 1) // 2
+n_aligned = K_a * (MEMORY_DEPTH + 1)
+n_cross = 2 * K_c * (CROSS_MEMORY + 1) * CROSS_LAG  # lagging + leading
+num_coefficients = n_aligned + n_cross
+print(f"GMP model: aligned order={POLY_ORDER} mem={MEMORY_DEPTH} ({n_aligned} terms)")
+print(f"           cross order={CROSS_ORDER} mem={CROSS_MEMORY} lag={CROSS_LAG} ({n_cross} terms)")
+print(f"           total coefficients: {num_coefficients}")
 
 # ---------------------------------------------------------------------------
 # Training: Indirect Learning Architecture (ILA)
 # ---------------------------------------------------------------------------
-# The ILA estimates a post-inverse of the PA, then uses it as a pre-distorter.
-#
-# Iteration 1: Estimate post-distorter from PA I/O data directly.
-#   - Input to basis matrix: PA output (normalized)
-#   - Target: PA input
-#
-# Iterations 2+: Apply current DPD, capture new PA output, re-estimate.
-#   - Input to basis matrix: new PA output (normalized)
-#   - Target: original input
-#
-# This iterative refinement converges to a better DPD as the operating
-# point of the post-distorter aligns with the pre-distorter usage.
 
 print()
 print("Training DPD (Indirect Learning Architecture)...")
@@ -117,26 +135,25 @@ for iteration in range(NUM_ITERATIONS):
     t_iter = time.time()
 
     if iteration == 0:
-        # First iteration: use PA output as post-distorter input
         dpd_input = y_train / pa_gain
         dpd_target = x_train
     else:
-        # Subsequent: apply current DPD, capture new PA output, re-estimate
-        x_dpd = apply_dpd(x_train, coefficients, K, MEMORY_DEPTH)
+        x_dpd = apply_dpd(x_train, coefficients)
         y_new = pa_model(x_dpd)
         dpd_input = y_new / pa_gain
         dpd_target = x_train
 
-    # Build basis matrix
-    U = build_basis_matrix(dpd_input, K, MEMORY_DEPTH)
+    # Build GMP basis matrix
+    U = build_gmp_basis_matrix(dpd_input, K_a, MEMORY_DEPTH,
+                               K_c, CROSS_MEMORY, CROSS_LAG)
 
-    # Regularized least squares: (U^H U + lambda*I) w = U^H d
+    # Regularized least squares
     A = U.conj().T @ U + REGULARIZATION * np.eye(num_coefficients)
     b = U.conj().T @ dpd_target
     coefficients = np.linalg.solve(A, b)
 
     # Quick training NMSE check
-    x_dpd_check = apply_dpd(x_train, coefficients, K, MEMORY_DEPTH)
+    x_dpd_check = apply_dpd(x_train, coefficients)
     y_check = pa_model(x_dpd_check)
     train_nmse = compute_nmse_db(y_check, x_train)
 
@@ -152,11 +169,11 @@ print()
 print("Evaluating on validation data...")
 
 def dpd_fn(x):
-    return apply_dpd(x, coefficients, K, MEMORY_DEPTH)
+    return apply_dpd(x, coefficients)
 
 results = evaluate_dpd(dpd_fn)
 
-# Generate diagnostic plots (PSD/ACPR, AM/AM, AM/PM, constellation)
+# Generate diagnostic plots
 x_val, _ = load_data("val")
 y_val_nodpd = pa_model(x_val)
 x_dpd_val = dpd_fn(x_val)
@@ -180,8 +197,6 @@ print(f"acpr_before_dbc:  {results['acpr_before_dbc']:.2f}")
 print(f"acpr_after_dbc:   {results['acpr_after_dbc']:.2f}")
 print(f"evm_before_pct:   {results['evm_before_percent']:.2f}")
 print(f"evm_after_pct:    {results['evm_percent']:.2f}")
-print(f"poly_order:       {POLY_ORDER}")
-print(f"memory_depth:     {MEMORY_DEPTH}")
 print(f"num_coefficients: {num_coefficients}")
 print(f"num_iterations:   {NUM_ITERATIONS}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
