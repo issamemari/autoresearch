@@ -154,7 +154,7 @@ def generate_ofdm_signal(num_samples, seed):
     # rectangular windowing. Uses zero-phase FIR filtering (filtfilt)
     # with a high-order Blackman-Harris window for deep stopband rejection.
     from scipy.signal import firwin, filtfilt
-    num_taps = 401
+    num_taps = 601
     cutoff = SIGNAL_BANDWIDTH / SAMPLE_RATE  # normalized cutoff
     filt = firwin(num_taps, cutoff, window='blackmanharris')
     signal = filtfilt(filt, 1.0, signal)
