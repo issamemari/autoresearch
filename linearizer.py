@@ -131,9 +131,8 @@ def apply_fir(x, h):
 
 
 def apply_full_dpd(x):
-    """Full DPD: LUT (NL inverse) -> FIR (memory inverse)."""
-    z = apply_lut_dpd(x)
-    return apply_fir(z, fir_coeffs)
+    """Full DPD: LUT only (memoryless NL inverse)."""
+    return apply_lut_dpd(x)
 
 
 for refine_iter in range(NUM_REFINE_ITERS):
