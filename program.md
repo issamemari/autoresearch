@@ -116,12 +116,12 @@ LOOP FOREVER:
 1. Look at the git state: the current branch/commit we're on
 2. Tune `linearizer.py` with an experimental idea by directly hacking the code.
 3. git commit
-4. Run the experiment: `uv run linearizer.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^nmse_db:\|^acpr_after_dbc:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If nmse_db improved (more negative), you "advance" the branch, keeping the git commit
-9. If nmse_db is equal or worse (less negative), you git reset back to where you started
+4. Run the experiment: `uv run linearizer.py`
+5. **Show the user**: full log output, all metrics, and the diagnostics.png plot
+6. Record the results in the tsv
+7. **Push every experiment** to the branch (`git push`), regardless of whether it improved or not. Every experiment is valuable data.
+8. If the metric improved, continue building on this change
+9. If the metric got worse, revert `linearizer.py` to the last good state before the next experiment
 
 **Timeout**: Each experiment should take well under 5 minutes for classical DPD. Neural network DPD might take a few minutes. If a run exceeds 10 minutes, kill it and treat it as a failure.
 
