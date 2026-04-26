@@ -34,58 +34,62 @@ RANDOM_SEED = 42                # Fixed seed for reproducibility
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch-dpd")
 
 # ---------------------------------------------------------------------------
-# PA Behavioral Model: Memory Polynomial (Parallel Hammerstein)
+# PA Behavioral Model: Saleh Model with Memory (Wiener structure)
 # ---------------------------------------------------------------------------
-# Represents a GaN Doherty PA operating at ~6 dB input back-off.
-# Model: y(n) = sum_k sum_m a_{k,m} * x(n-m) * |x(n-m)|^{2k}
+# Classic Saleh AM/AM and AM/PM model (A. Saleh, IEEE Trans. Comm., 1981)
+# preceded by a linear FIR filter to capture memory effects.
 #
-# Each nonlinear order has a different memory depth, producing
-# order-dependent memory effects. This makes the PA harder to linearize
-# than a simple memoryless model — a basic memory polynomial DPD won't
-# fully capture the structure, leaving room for the agent to improve
-# with GMP cross-terms, neural networks, or other advanced techniques.
+# Wiener structure: x -> [FIR memory filter] -> z -> [Saleh NL] -> y
 #
-# Polynomial order 2k+1: 1 (linear), 3, 5, 7, 9
-# Coefficients are complex-valued (capturing both AM/AM and AM/PM).
+# AM/AM: A(r) = alpha_a * r / (1 + beta_a * r^2)
+# AM/PM: Phi(r) = alpha_phi * r^2 / (1 + beta_phi * r^2)
+# Output: y = A(|z|) * exp(j * (arg(z) + Phi(|z|)))
+#
+# The memory filter models electrical/thermal memory effects in the PA
+# matching network and bias circuitry. Combined with the Saleh nonlinearity,
+# this produces a PA that requires both nonlinear compensation and memory
+# equalization — a basic memoryless DPD won't fully linearize it.
 
-PA_COEFFICIENTS = [
-    # (k, m, coefficient)  where order = 2k+1, m = memory tap
-    # k=0: linear path (4 memory taps — electrical memory)
-    (0, 0,  1.0000 + 0.0000j),
-    (0, 1,  0.0500 - 0.0200j),
-    (0, 2,  0.0120 + 0.0080j),
-    (0, 3, -0.0040 + 0.0025j),
-    # k=1: 3rd order (3 memory taps)
-    (1, 0, -0.4000 + 0.1500j),
-    (1, 1, -0.0600 + 0.0250j),
-    (1, 2, -0.0180 + 0.0100j),
-    # k=2: 5th order (2 memory taps)
-    (2, 0,  0.1500 - 0.0800j),
-    (2, 1,  0.0300 - 0.0150j),
-    # k=3: 7th order (2 memory taps)
-    (3, 0, -0.0400 + 0.0250j),
-    (3, 1, -0.0100 + 0.0060j),
-    # k=4: 9th order (memoryless)
-    (4, 0,  0.0080 - 0.0050j),
-]
+# Saleh model parameters (solid-state class AB PA)
+# AM/AM has moderate compression; AM/PM is mild at average power
+# but significant at peaks (~11 degrees at r=0.9).
+SALEH_ALPHA_A = 2.0          # AM/AM small-signal gain
+SALEH_BETA_A = 0.5           # AM/AM compression factor
+SALEH_ALPHA_PHI = 0.3        # AM/PM coefficient (radians)
+SALEH_BETA_PHI = 0.3         # AM/PM saturation factor
 
-# Derived constants
-PA_MAX_K = max(k for k, m, c in PA_COEFFICIENTS)
-PA_MAX_MEMORY = max(m for k, m, c in PA_COEFFICIENTS)
+# Memory filter coefficients (FIR, applied before nonlinearity)
+PA_MEMORY_FILTER = np.array([
+    1.0000 + 0.0000j,       # main tap
+    0.0500 - 0.0200j,       # 1-sample memory
+    0.0120 + 0.0080j,       # 2-sample memory
+   -0.0040 + 0.0025j,       # 3-sample memory
+], dtype=np.complex128)
 
-# Parse into dict for fast lookup
-_pa_coeffs = {}
-for k, m, c in PA_COEFFICIENTS:
-    _pa_coeffs[(k, m)] = c
+PA_MEMORY_DEPTH = len(PA_MEMORY_FILTER) - 1
 
 # ---------------------------------------------------------------------------
 # PA Model (DO NOT MODIFY — this is the ground truth PA)
 # ---------------------------------------------------------------------------
 
+def _saleh_nonlinearity(x):
+    """Apply memoryless Saleh AM/AM and AM/PM distortion."""
+    r = np.abs(x)
+    theta = np.angle(x)
+
+    # AM/AM: A(r) = alpha_a * r / (1 + beta_a * r^2)
+    am_am = SALEH_ALPHA_A * r / (1 + SALEH_BETA_A * r ** 2)
+
+    # AM/PM: Phi(r) = alpha_phi * r^2 / (1 + beta_phi * r^2)
+    am_pm = SALEH_ALPHA_PHI * r ** 2 / (1 + SALEH_BETA_PHI * r ** 2)
+
+    return am_am * np.exp(1j * (theta + am_pm))
+
+
 def pa_model(x):
     """
     Apply the PA behavioral model to complex baseband input signal.
-    Uses the fixed memory polynomial coefficients defined above.
+    Wiener structure: linear FIR memory filter followed by Saleh nonlinearity.
 
     Args:
         x: complex numpy array, input signal
@@ -93,15 +97,16 @@ def pa_model(x):
         y: complex numpy array, PA output signal (same length as x)
     """
     N = len(x)
-    M = PA_MAX_MEMORY
+    M = PA_MEMORY_DEPTH
+
+    # Step 1: Linear memory filter (FIR convolution)
     x_pad = np.concatenate([np.zeros(M, dtype=np.complex128), x])
-    y = np.zeros(N, dtype=np.complex128)
+    z = np.zeros(N, dtype=np.complex128)
+    for m, h in enumerate(PA_MEMORY_FILTER):
+        z += h * x_pad[M - m : N + M - m]
 
-    for (k, m), coeff in _pa_coeffs.items():
-        x_del = x_pad[M - m : N + M - m]
-        y += coeff * x_del * np.abs(x_del) ** (2 * k)
-
-    return y
+    # Step 2: Saleh memoryless nonlinearity
+    return _saleh_nonlinearity(z)
 
 # ---------------------------------------------------------------------------
 # Signal generation
@@ -110,7 +115,7 @@ def pa_model(x):
 def generate_ofdm_signal(num_samples, seed):
     """
     Generate OFDM-like complex baseband test signal.
-    Uses random 64-QAM modulation on active subcarriers within 20 MHz.
+    Uses random 16-QAM modulation on active subcarriers within 20 MHz.
     Subcarrier spacing: 122.88 MHz / 2048 = 60 kHz.
     Active subcarriers: 334 (spanning ~20 MHz).
     Produces realistic PAPR (~8-10 dB) and flat in-band spectrum.
@@ -126,10 +131,10 @@ def generate_ofdm_signal(num_samples, seed):
 
     samples = []
     for _ in range(num_symbols):
-        # 64-QAM constellation (normalized)
-        re = rng.integers(0, 8, num_active) * 2 - 7  # {-7,-5,-3,-1,1,3,5,7}
-        im = rng.integers(0, 8, num_active) * 2 - 7
-        qam = (re + 1j * im) / np.sqrt(42)  # normalized to unit avg power
+        # 16-QAM constellation (normalized to unit average power)
+        re = rng.integers(0, 4, num_active) * 2 - 3  # {-3, -1, 1, 3}
+        im = rng.integers(0, 4, num_active) * 2 - 3
+        qam = (re + 1j * im) / np.sqrt(10)  # E[|s|^2] = 1
 
         # Map to subcarriers (DC null, guard bands at edges)
         freq = np.zeros(nfft, dtype=np.complex128)
@@ -146,7 +151,7 @@ def generate_ofdm_signal(num_samples, seed):
     signal = np.concatenate(samples)[:num_samples]
 
     # Normalize to target RMS for ~6 dB input back-off
-    # With PA Asat ~ 1.0, RMS = 0.3 gives peaks near saturation
+    # With Saleh saturation near |x|~0.9, RMS = 0.3 gives peaks near compression
     target_rms = 0.3
     signal = signal / np.sqrt(np.mean(np.abs(signal) ** 2)) * target_rms
 

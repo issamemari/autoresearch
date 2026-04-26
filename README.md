@@ -10,7 +10,7 @@ An AI agent is given a PA simulation environment and a baseline DPD implementati
 
 The repo has three files that matter:
 
-- **`prepare.py`** — fixed PA behavioral model (GaN Doherty, memory polynomial), OFDM signal generation, and evaluation metrics (NMSE, ACPR, EVM). Not modified.
+- **`prepare.py`** — fixed PA behavioral model (Saleh with memory), 16-QAM OFDM signal generation, and evaluation metrics (NMSE, ACPR, EVM). Not modified.
 - **`linearizer.py`** — the single file the agent edits. Contains the DPD model, coefficient estimation algorithm, and hyperparameters. Everything is fair game: model structure, estimation method, basis functions, neural networks, etc.
 - **`program.md`** — instructions for the agent. Edited by the human.
 
@@ -18,14 +18,14 @@ The metric is **nmse_db** (Normalized Mean Square Error in dB) — more negative
 
 ## The PA model
 
-The simulated PA is a memory polynomial (parallel Hammerstein) model representing a GaN Doherty amplifier:
+The simulated PA uses the classic **Saleh model** (A. Saleh, IEEE Trans. Comm., 1981) with a Wiener memory structure:
 
-- **Nonlinear orders**: 1, 3, 5, 7, 9
-- **Memory effects**: order-dependent memory depth (up to 3 taps)
-- **AM/PM distortion**: complex-valued coefficients
-- **Operating point**: ~6 dB input back-off with 20 MHz OFDM signal
+- **AM/AM**: `A(r) = alpha_a * r / (1 + beta_a * r^2)` — compressive gain
+- **AM/PM**: `Phi(r) = alpha_phi * r^2 / (1 + beta_phi * r^2)` — phase distortion
+- **Memory**: linear FIR pre-filter (4 taps) before the Saleh nonlinearity (Wiener model)
+- **Signal**: 16-QAM OFDM, 20 MHz bandwidth, ~6 dB input back-off
 
-The order-dependent memory structure means a basic memory polynomial DPD won't fully capture the PA behavior, leaving room for the agent to discover better approaches (GMP cross-terms, neural networks, etc.).
+The Wiener structure (linear filter -> nonlinearity) means a basic memoryless DPD won't fully linearize the PA — the agent needs to compensate for both the Saleh nonlinearity and the memory effects.
 
 ## Quick start
 

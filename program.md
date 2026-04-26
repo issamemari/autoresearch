@@ -14,7 +14,7 @@ To set up a new experiment, work with the user to:
 2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
 3. **Read the in-scope files**: The repo is small. Read these files for full context:
    - `README.md` — repository context.
-   - `prepare.py` — fixed constants, PA model, signal generation, evaluation harness. Do not modify.
+   - `prepare.py` — fixed constants, Saleh PA model with memory, 16-QAM OFDM signal generation, evaluation harness. Do not modify.
    - `linearizer.py` — the file you modify. DPD model, coefficient estimation, hyperparameters.
 4. **Verify data exists**: Check that `~/.cache/autoresearch-dpd/` contains the `.npy` data files. If not, tell the human to run `uv run prepare.py`.
 5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
