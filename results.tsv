@@ -1,0 +1,9 @@
+commit	nmse_db	acpr_after_dbc	status	description
+c39a16a	-27.74	-24.48	keep	baseline MP order=7 memory=3 3-iter ILA
+ee88251	-31.29	-24.47	keep	reduce ILA to 1 iteration
+67fa901	-26.98	-24.11	discard	order=11 memory=5 (overfitting)
+43f0fd0	-29.27	-24.34	discard	order=9 memory=4 reg=1e-4 (regularization too strong)
+fdf0811	-31.30	-24.48	keep	GMP with cross-terms (40 coefficients)
+134c3c7	-28.03	-24.40	discard	damped ILA 5 iters alpha=0.3 (ACPR unchanged)
+f5b2d71	-28.26	-24.24	discard	direct learning (DL degraded over iters)
+7c13a34	-25.53	-24.24	discard	LUT+FIR Hammerstein (FIR refinement degraded)
