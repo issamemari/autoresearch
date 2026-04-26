@@ -10,3 +10,4 @@ f5b2d71	-28.26	-24.24	discard	direct learning (DL degraded over iters)
 425a8d5	-27.12	-24.34	discard	LUT-only (no FIR)
 b57cc6e	-28.97	-24.32	discard	large GMP 102 coeffs (overfitting, ACPR same)
 ea42b68	-28.65	-24.32	discard	NN DPD 3-layer 64h (ACPR still -24)
+87133e8	-30.48	-30.67	keep	GMP baseline on band-limited signal
