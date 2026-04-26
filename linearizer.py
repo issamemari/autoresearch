@@ -12,7 +12,7 @@ import time
 import numpy as np
 from prepare import (
     TIME_BUDGET, SAMPLE_RATE, SIGNAL_BANDWIDTH,
-    load_data, pa_model, evaluate_dpd,
+    load_data, pa_model, evaluate_dpd, plot_diagnostics,
     compute_nmse_db, compute_acpr_db,
 )
 
@@ -160,6 +160,11 @@ results = evaluate_dpd(dpd_fn)
 x_val, _ = load_data("val")
 y_val_nodpd = pa_model(x_val)
 nmse_no_dpd_val = compute_nmse_db(y_val_nodpd, x_val)
+
+# Generate diagnostic plots (PSD/ACPR, AM/AM, AM/PM, constellation)
+x_dpd_val = dpd_fn(x_val)
+y_val_dpd = pa_model(x_dpd_val)
+plot_diagnostics(x_val, y_val_nodpd, y_val_dpd, "diagnostics.png")
 
 t_end = time.time()
 

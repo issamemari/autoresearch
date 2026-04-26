@@ -259,6 +259,155 @@ def evaluate_dpd(dpd_fn):
     }
 
 # ---------------------------------------------------------------------------
+# Diagnostic plots (DO NOT CHANGE — fixed visualization)
+# ---------------------------------------------------------------------------
+
+def plot_diagnostics(x_input, y_no_dpd, y_with_dpd, filename="diagnostics.png"):
+    """
+    Generate diagnostic plots comparing PA output with and without DPD.
+    Creates a 2x2 figure: PSD (ACPR), AM/AM, AM/PM, Constellation.
+
+    Args:
+        x_input: original input signal (complex array)
+        y_no_dpd: PA output without DPD (complex array)
+        y_with_dpd: PA output with DPD applied (complex array)
+        filename: output file path for the figure
+    """
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # ---- PSD / ACPR ----
+    ax = axes[0, 0]
+    nperseg = min(4096, len(x_input))
+
+    f_in, psd_in = welch(x_input, fs=SAMPLE_RATE, nperseg=nperseg,
+                         return_onesided=False, scaling='density')
+    f_no, psd_no = welch(y_no_dpd, fs=SAMPLE_RATE, nperseg=nperseg,
+                         return_onesided=False, scaling='density')
+    f_wd, psd_wd = welch(y_with_dpd, fs=SAMPLE_RATE, nperseg=nperseg,
+                         return_onesided=False, scaling='density')
+
+    # Center DC and convert to dB
+    f_in, psd_in = np.fft.fftshift(f_in), np.fft.fftshift(psd_in)
+    f_no, psd_no = np.fft.fftshift(f_no), np.fft.fftshift(psd_no)
+    f_wd, psd_wd = np.fft.fftshift(f_wd), np.fft.fftshift(psd_wd)
+
+    # Normalize PSD to peak of no-DPD for easier comparison
+    peak_psd = np.max(psd_no)
+    psd_in_db = 10 * np.log10(np.maximum(psd_in / peak_psd, 1e-20))
+    psd_no_db = 10 * np.log10(np.maximum(psd_no / peak_psd, 1e-20))
+    psd_wd_db = 10 * np.log10(np.maximum(psd_wd / peak_psd, 1e-20))
+
+    ax.plot(f_in / 1e6, psd_in_db, color='#4a9eed', alpha=0.5,
+            linewidth=1, label='Input')
+    ax.plot(f_no / 1e6, psd_no_db, color='#ef4444', alpha=0.8,
+            linewidth=1.2, label='PA only (no DPD)')
+    ax.plot(f_wd / 1e6, psd_wd_db, color='#22c55e', alpha=0.8,
+            linewidth=1.2, label='PA + DPD')
+
+    half_bw_mhz = SIGNAL_BANDWIDTH / 2e6
+    for bw in [-half_bw_mhz, half_bw_mhz]:
+        ax.axvline(bw, color='gray', linestyle='--', alpha=0.4, linewidth=0.8)
+    ax.axvspan(-half_bw_mhz, half_bw_mhz, alpha=0.05, color='blue')
+
+    ax.set_xlabel('Frequency (MHz)')
+    ax.set_ylabel('Normalized PSD (dB)')
+    ax.set_title('Power Spectral Density (ACPR)')
+    ax.legend(fontsize=9, loc='lower center')
+    ax.set_xlim([-3.5 * half_bw_mhz, 3.5 * half_bw_mhz])
+    ax.set_ylim(bottom=-80)
+    ax.grid(True, alpha=0.3)
+
+    # ---- AM/AM ----
+    ax = axes[0, 1]
+    r_in = np.abs(x_input)
+    r_out_no = np.abs(y_no_dpd)
+    r_out_wd = np.abs(y_with_dpd)
+
+    # Downsample for scatter plot
+    step = max(1, len(r_in) // 3000)
+    sort_idx = np.argsort(r_in)
+    idx = sort_idx[::step]
+
+    ax.scatter(r_in[idx], r_out_no[idx], s=1, alpha=0.3, c='#ef4444',
+               label='PA only (no DPD)', rasterized=True)
+    ax.scatter(r_in[idx], r_out_wd[idx], s=1, alpha=0.3, c='#22c55e',
+               label='PA + DPD', rasterized=True)
+
+    # Ideal linear reference lines
+    gain_no = np.abs(np.vdot(x_input, y_no_dpd) / np.vdot(x_input, x_input))
+    gain_wd = np.abs(np.vdot(x_input, y_with_dpd) / np.vdot(x_input, x_input))
+    r_max = np.max(r_in) * 1.05
+    ax.plot([0, r_max], [0, gain_no * r_max], 'r--', alpha=0.4,
+            linewidth=1, label=f'Ideal linear (G={gain_no:.2f})')
+
+    ax.set_xlabel('Input Amplitude |x|')
+    ax.set_ylabel('Output Amplitude |y|')
+    ax.set_title('AM/AM Characteristic')
+    ax.legend(fontsize=9, loc='upper left', markerscale=8)
+    ax.set_xlim([0, r_max])
+    ax.grid(True, alpha=0.3)
+
+    # ---- AM/PM ----
+    ax = axes[1, 0]
+
+    # Phase distortion: angle(y * conj(x)) handles wrapping correctly
+    mask = r_in > 0.03 * np.max(r_in)  # ignore near-zero amplitudes
+    phase_no = np.degrees(np.angle(y_no_dpd[mask] * np.conj(x_input[mask])))
+    phase_wd = np.degrees(np.angle(y_with_dpd[mask] * np.conj(x_input[mask])))
+    r_masked = r_in[mask]
+
+    sort_idx2 = np.argsort(r_masked)
+    step2 = max(1, len(r_masked) // 3000)
+    idx2 = sort_idx2[::step2]
+
+    ax.scatter(r_masked[idx2], phase_no[idx2], s=1, alpha=0.3, c='#ef4444',
+               label='PA only (no DPD)', rasterized=True)
+    ax.scatter(r_masked[idx2], phase_wd[idx2], s=1, alpha=0.3, c='#22c55e',
+               label='PA + DPD', rasterized=True)
+    ax.axhline(0, color='gray', linestyle='--', alpha=0.4, linewidth=0.8)
+
+    ax.set_xlabel('Input Amplitude |x|')
+    ax.set_ylabel('Phase Distortion (degrees)')
+    ax.set_title('AM/PM Characteristic')
+    ax.legend(fontsize=9, loc='upper left', markerscale=8)
+    ax.grid(True, alpha=0.3)
+
+    # ---- Constellation (I/Q scatter) ----
+    ax = axes[1, 1]
+
+    # Gain-align outputs to input for fair constellation comparison
+    alpha_no = np.vdot(x_input, y_no_dpd) / np.vdot(x_input, x_input)
+    alpha_wd = np.vdot(x_input, y_with_dpd) / np.vdot(x_input, x_input)
+    y_no_aligned = y_no_dpd / alpha_no
+    y_wd_aligned = y_with_dpd / alpha_wd
+
+    n_plot = min(5000, len(x_input))
+    ax.scatter(np.real(y_no_aligned[:n_plot]), np.imag(y_no_aligned[:n_plot]),
+               s=1, alpha=0.15, c='#ef4444', label='PA only (no DPD)',
+               rasterized=True)
+    ax.scatter(np.real(y_wd_aligned[:n_plot]), np.imag(y_wd_aligned[:n_plot]),
+               s=1, alpha=0.15, c='#22c55e', label='PA + DPD',
+               rasterized=True)
+    ax.scatter(np.real(x_input[:n_plot]), np.imag(x_input[:n_plot]),
+               s=1, alpha=0.08, c='#4a9eed', label='Input (reference)',
+               rasterized=True)
+
+    ax.set_xlabel('In-Phase (I)')
+    ax.set_ylabel('Quadrature (Q)')
+    ax.set_title('Constellation (gain-aligned)')
+    ax.legend(fontsize=9, loc='upper right', markerscale=10)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+
+    fig.suptitle('DPD Diagnostics — With vs Without DPD', fontsize=16, y=1.01)
+    plt.tight_layout()
+    plt.savefig(filename, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Diagnostics saved to {filename}")
+
+# ---------------------------------------------------------------------------
 # Data management
 # ---------------------------------------------------------------------------
 
