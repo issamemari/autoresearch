@@ -12,3 +12,4 @@ b57cc6e	-28.97	-24.32	discard	large GMP 102 coeffs (overfitting, ACPR same)
 ea42b68	-28.65	-24.32	discard	NN DPD 3-layer 64h (ACPR still -24)
 87133e8	-30.48	-30.67	keep	GMP baseline on band-limited signal
 57fc64a	-28.19	-30.10	discard	larger GMP 102 coeffs (overfitting)
+584872c	-28.18	-30.36	discard	2 damped ILA iters (worse than 1-iter)
