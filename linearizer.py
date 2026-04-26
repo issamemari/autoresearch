@@ -23,9 +23,9 @@ MEMORY_DEPTH = 3
 CROSS_ORDER = 5
 CROSS_MEMORY = 2
 CROSS_LAG = 2
-NUM_ITERATIONS = 2
+NUM_ITERATIONS = 1
 REGULARIZATION = 1e-6
-ILA_DAMPING = 0.5       # mix 50% new + 50% old coefficients
+DPD_FILTER_BW = 3.0     # DPD output filter bandwidth as multiple of signal BW
 
 # ---------------------------------------------------------------------------
 # GMP Basis Matrix
@@ -60,11 +60,28 @@ def build_gmp_basis_matrix(x, K_a, M_a, K_c, M_c, L_c):
     return np.column_stack(columns)
 
 
+def _bandlimit_filter(x, bw_mult):
+    """Apply a low-pass filter to limit DPD output bandwidth."""
+    from scipy.signal import firwin, lfilter
+    cutoff = bw_mult * SIGNAL_BANDWIDTH / SAMPLE_RATE
+    cutoff = min(cutoff, 0.99)  # stay below Nyquist
+    num_taps = 51
+    filt = firwin(num_taps, cutoff, window='hamming')
+    filtered = lfilter(filt, 1.0, x)
+    # Compensate group delay
+    delay = (num_taps - 1) // 2
+    filtered = np.roll(filtered, -delay)
+    return filtered
+
+
 def apply_dpd(x, coefficients):
     K_a = (POLY_ORDER + 1) // 2
     K_c = (CROSS_ORDER - 1) // 2
     U = build_gmp_basis_matrix(x, K_a, MEMORY_DEPTH, K_c, CROSS_MEMORY, CROSS_LAG)
-    return U @ coefficients
+    y = U @ coefficients
+    if DPD_FILTER_BW > 0:
+        y = _bandlimit_filter(y, DPD_FILTER_BW)
+    return y
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -115,12 +132,7 @@ for iteration in range(NUM_ITERATIONS):
 
     A = U.conj().T @ U + REGULARIZATION * np.eye(num_coefficients)
     b = U.conj().T @ dpd_target
-    new_coefficients = np.linalg.solve(A, b)
-
-    if coefficients is None:
-        coefficients = new_coefficients
-    else:
-        coefficients = (1 - ILA_DAMPING) * coefficients + ILA_DAMPING * new_coefficients
+    coefficients = np.linalg.solve(A, b)
 
     x_dpd_check = apply_dpd(x_train, coefficients)
     y_check = pa_model(x_dpd_check)
