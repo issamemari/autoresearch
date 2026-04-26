@@ -1,389 +1,334 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+PA simulation and evaluation harness for autonomous DPD research.
+Generates PA behavioral model data and provides fixed evaluation metrics.
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
+    python prepare.py                      # generate data with defaults
+    python prepare.py --num-samples 200000 # custom training sample count
 
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+Data is stored in ~/.cache/autoresearch-dpd/.
 """
 
 import os
 import sys
 import time
-import math
 import argparse
-import pickle
-from multiprocessing import Pool
-
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
-import torch
+import numpy as np
+from scipy.signal import welch
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+SAMPLE_RATE = 122.88e6          # Sample rate (Hz), standard for 5G NR
+SIGNAL_BANDWIDTH = 20e6         # Signal bandwidth (Hz), 20 MHz LTE/NR channel
+NUM_TRAIN_SAMPLES = 200_000     # Training samples
+NUM_VAL_SAMPLES = 50_000        # Validation samples
+TIME_BUDGET = 300               # Time budget in seconds (5 minutes)
+RANDOM_SEED = 42                # Fixed seed for reproducibility
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Cache configuration
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
-
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
-
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
+CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch-dpd")
 
 # ---------------------------------------------------------------------------
-# Data download
+# PA Behavioral Model: Memory Polynomial (Parallel Hammerstein)
 # ---------------------------------------------------------------------------
+# Represents a GaN Doherty PA operating at ~6 dB input back-off.
+# Model: y(n) = sum_k sum_m a_{k,m} * x(n-m) * |x(n-m)|^{2k}
+#
+# Each nonlinear order has a different memory depth, producing
+# order-dependent memory effects. This makes the PA harder to linearize
+# than a simple memoryless model — a basic memory polynomial DPD won't
+# fully capture the structure, leaving room for the agent to improve
+# with GMP cross-terms, neural networks, or other advanced techniques.
+#
+# Polynomial order 2k+1: 1 (linear), 3, 5, 7, 9
+# Coefficients are complex-valued (capturing both AM/AM and AM/PM).
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
+PA_COEFFICIENTS = [
+    # (k, m, coefficient)  where order = 2k+1, m = memory tap
+    # k=0: linear path (4 memory taps — electrical memory)
+    (0, 0,  1.0000 + 0.0000j),
+    (0, 1,  0.0500 - 0.0200j),
+    (0, 2,  0.0120 + 0.0080j),
+    (0, 3, -0.0040 + 0.0025j),
+    # k=1: 3rd order (3 memory taps)
+    (1, 0, -0.4000 + 0.1500j),
+    (1, 1, -0.0600 + 0.0250j),
+    (1, 2, -0.0180 + 0.0100j),
+    # k=2: 5th order (2 memory taps)
+    (2, 0,  0.1500 - 0.0800j),
+    (2, 1,  0.0300 - 0.0150j),
+    # k=3: 7th order (2 memory taps)
+    (3, 0, -0.0400 + 0.0250j),
+    (3, 1, -0.0100 + 0.0060j),
+    # k=4: 9th order (memoryless)
+    (4, 0,  0.0080 - 0.0050j),
+]
 
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
+# Derived constants
+PA_MAX_K = max(k for k, m, c in PA_COEFFICIENTS)
+PA_MAX_MEMORY = max(m for k, m, c in PA_COEFFICIENTS)
 
-
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
-
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
-
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
+# Parse into dict for fast lookup
+_pa_coeffs = {}
+for k, m, c in PA_COEFFICIENTS:
+    _pa_coeffs[(k, m)] = c
 
 # ---------------------------------------------------------------------------
-# Tokenizer training
+# PA Model (DO NOT MODIFY — this is the ground truth PA)
 # ---------------------------------------------------------------------------
 
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
-
-
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
-
-
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
-
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
-
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
-
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
-
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
-
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
-    )
-
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
-
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
-
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
-
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
-
-# ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
-# ---------------------------------------------------------------------------
-
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
-
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
-
-
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
-
-
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
-    else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
-
-
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+def pa_model(x):
     """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
+    Apply the PA behavioral model to complex baseband input signal.
+    Uses the fixed memory polynomial coefficients defined above.
+
+    Args:
+        x: complex numpy array, input signal
+    Returns:
+        y: complex numpy array, PA output signal (same length as x)
+    """
+    N = len(x)
+    M = PA_MAX_MEMORY
+    x_pad = np.concatenate([np.zeros(M, dtype=np.complex128), x])
+    y = np.zeros(N, dtype=np.complex128)
+
+    for (k, m), coeff in _pa_coeffs.items():
+        x_del = x_pad[M - m : N + M - m]
+        y += coeff * x_del * np.abs(x_del) ** (2 * k)
+
+    return y
+
+# ---------------------------------------------------------------------------
+# Signal generation
+# ---------------------------------------------------------------------------
+
+def generate_ofdm_signal(num_samples, seed):
+    """
+    Generate OFDM-like complex baseband test signal.
+    Uses random 64-QAM modulation on active subcarriers within 20 MHz.
+    Subcarrier spacing: 122.88 MHz / 2048 = 60 kHz.
+    Active subcarriers: 334 (spanning ~20 MHz).
+    Produces realistic PAPR (~8-10 dB) and flat in-band spectrum.
+    """
+    rng = np.random.default_rng(seed)
+
+    nfft = 2048
+    num_active = 334        # 334 * 60 kHz = 20.04 MHz signal bandwidth
+    cp_len = 144            # normal cyclic prefix
+    symbol_len = nfft + cp_len
+
+    num_symbols = num_samples // symbol_len + 2
+
+    samples = []
+    for _ in range(num_symbols):
+        # 64-QAM constellation (normalized)
+        re = rng.integers(0, 8, num_active) * 2 - 7  # {-7,-5,-3,-1,1,3,5,7}
+        im = rng.integers(0, 8, num_active) * 2 - 7
+        qam = (re + 1j * im) / np.sqrt(42)  # normalized to unit avg power
+
+        # Map to subcarriers (DC null, guard bands at edges)
+        freq = np.zeros(nfft, dtype=np.complex128)
+        freq[1:num_active // 2 + 1] = qam[:num_active // 2]
+        freq[nfft - num_active // 2:] = qam[num_active // 2:]
+
+        # IFFT to time domain
+        td = np.fft.ifft(freq) * np.sqrt(nfft)
+
+        # Add cyclic prefix
+        symbol = np.concatenate([td[-cp_len:], td])
+        samples.append(symbol)
+
+    signal = np.concatenate(samples)[:num_samples]
+
+    # Normalize to target RMS for ~6 dB input back-off
+    # With PA Asat ~ 1.0, RMS = 0.3 gives peaks near saturation
+    target_rms = 0.3
+    signal = signal / np.sqrt(np.mean(np.abs(signal) ** 2)) * target_rms
+
+    return signal.astype(np.complex128)
+
+# ---------------------------------------------------------------------------
+# Evaluation metrics (DO NOT CHANGE — these are the fixed metrics)
+# ---------------------------------------------------------------------------
+
+def compute_nmse_db(y_actual, x_ref):
+    """
+    Normalized Mean Square Error in dB. Primary optimization metric.
+
+    First aligns y_actual to x_ref via least-squares gain estimation
+    (compensating for PA linear gain), then computes NMSE.
+    More negative = better linearization.
+
+    Args:
+        y_actual: PA output (complex array)
+        x_ref: original input signal (complex array)
+    Returns:
+        NMSE in dB (float, negative)
+    """
+    # LS gain alignment: alpha = (x^H y) / (x^H x)
+    alpha = np.vdot(x_ref, y_actual) / np.vdot(x_ref, x_ref)
+    y_ref = alpha * x_ref
+    error = y_actual - y_ref
+    nmse = np.sum(np.abs(error) ** 2) / np.sum(np.abs(y_ref) ** 2)
+    return 10 * np.log10(max(nmse, 1e-100))
+
+
+def compute_acpr_db(signal, sample_rate=SAMPLE_RATE, signal_bw=SIGNAL_BANDWIDTH):
+    """
+    Adjacent Channel Power Ratio in dBc.
+    Measures spectral regrowth in adjacent channels (worst of upper/lower).
+    More negative = better.
+
+    Main channel:    [-BW/2, +BW/2]
+    Lower adjacent:  [-3*BW/2, -BW/2]
+    Upper adjacent:  [+BW/2, +3*BW/2]
+    """
+    nperseg = min(4096, len(signal))
+    freqs, psd = welch(signal, fs=sample_rate, nperseg=nperseg,
+                       return_onesided=False, scaling='density')
+
+    # fftshift to center DC
+    freqs = np.fft.fftshift(freqs)
+    psd = np.fft.fftshift(psd)
+
+    half_bw = signal_bw / 2
+    df = freqs[1] - freqs[0]
+
+    main_mask = np.abs(freqs) <= half_bw
+    lower_mask = (freqs >= -3 * half_bw) & (freqs < -half_bw)
+    upper_mask = (freqs > half_bw) & (freqs <= 3 * half_bw)
+
+    main_power = np.sum(psd[main_mask]) * df
+    lower_power = np.sum(psd[lower_mask]) * df
+    upper_power = np.sum(psd[upper_mask]) * df
+
+    adj_power = max(lower_power, upper_power)
+    if main_power <= 0:
+        return 0.0
+    return 10 * np.log10(max(adj_power / main_power, 1e-100))
+
+
+def compute_evm_percent(y_actual, x_ref):
+    """
+    Error Vector Magnitude as a percentage.
+    Lower = better.
+    """
+    alpha = np.vdot(x_ref, y_actual) / np.vdot(x_ref, x_ref)
+    y_ref = alpha * x_ref
+    error = y_actual - y_ref
+    evm = np.sqrt(np.mean(np.abs(error) ** 2) / np.mean(np.abs(y_ref) ** 2))
+    return evm * 100
+
+
+def evaluate_dpd(dpd_fn):
+    """
+    Fixed DPD evaluation (DO NOT CHANGE — this is the ground truth metric).
+
+    Applies DPD to the validation input, passes through the PA model,
+    and computes all metrics. Also computes PA-only metrics for comparison.
+
+    Args:
+        dpd_fn: callable, takes complex input array -> returns predistorted array
+    Returns:
+        dict with nmse_db, acpr_before_dbc, acpr_after_dbc, evm_percent
+    """
+    x_val, _ = load_data("val")
+
+    # PA output with DPD
+    x_dpd = dpd_fn(x_val)
+    y_with_dpd = pa_model(x_dpd)
+
+    # PA output without DPD (for comparison)
+    y_no_dpd = pa_model(x_val)
+
+    return {
+        "nmse_db": compute_nmse_db(y_with_dpd, x_val),
+        "acpr_before_dbc": compute_acpr_db(y_no_dpd),
+        "acpr_after_dbc": compute_acpr_db(y_with_dpd),
+        "evm_percent": compute_evm_percent(y_with_dpd, x_val),
+    }
+
+# ---------------------------------------------------------------------------
+# Data management
+# ---------------------------------------------------------------------------
+
+def load_data(split="train"):
+    """
+    Load PA input/output data.
+    Returns (input_signal, pa_output) as complex numpy arrays.
     """
     assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
+    x = np.load(os.path.join(CACHE_DIR, f"{split}_input.npy"))
+    y = np.load(os.path.join(CACHE_DIR, f"{split}_output.npy"))
+    return x, y
 
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
 
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+def generate_and_save_data(num_train=NUM_TRAIN_SAMPLES, num_val=NUM_VAL_SAMPLES):
+    """Generate PA simulation data and save to cache directory."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
 
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
+    files = ["train_input.npy", "train_output.npy",
+             "val_input.npy", "val_output.npy"]
+    if all(os.path.exists(os.path.join(CACHE_DIR, f)) for f in files):
+        print(f"Data: already generated at {CACHE_DIR}")
+        return
 
-                remaining = row_capacity - pos
+    print("Generating PA simulation data...")
+    t0 = time.time()
 
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
+    # Training data
+    print(f"  Training signal ({num_train:,} samples)...")
+    x_train = generate_ofdm_signal(num_train, seed=RANDOM_SEED)
+    y_train = pa_model(x_train)
+    np.save(os.path.join(CACHE_DIR, "train_input.npy"), x_train)
+    np.save(os.path.join(CACHE_DIR, "train_output.npy"), y_train)
 
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
+    # Validation data (different seed for independent evaluation)
+    print(f"  Validation signal ({num_val:,} samples)...")
+    x_val = generate_ofdm_signal(num_val, seed=RANDOM_SEED + 1)
+    y_val = pa_model(x_val)
+    np.save(os.path.join(CACHE_DIR, "val_input.npy"), x_val)
+    np.save(os.path.join(CACHE_DIR, "val_output.npy"), y_val)
 
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
+    t1 = time.time()
 
-# ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
-    """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
-    """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
+    # Summary
+    nmse_no_dpd = compute_nmse_db(y_val, x_val)
+    acpr_no_dpd = compute_acpr_db(y_val)
+    papr_db = 10 * np.log10(np.max(np.abs(x_train) ** 2) / np.mean(np.abs(x_train) ** 2))
+    print(f"  Signal PAPR: {papr_db:.1f} dB")
+    print(f"  PA NMSE (no DPD):  {nmse_no_dpd:.2f} dB")
+    print(f"  PA ACPR (no DPD):  {acpr_no_dpd:.2f} dBc")
+    print(f"  Generated in {t1 - t0:.1f}s")
+    print(f"  Saved to {CACHE_DIR}")
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+    parser = argparse.ArgumentParser(
+        description="Generate PA simulation data for DPD research")
+    parser.add_argument("--num-samples", type=int, default=NUM_TRAIN_SAMPLES,
+                        help="Number of training samples")
+    parser.add_argument("--regenerate", action="store_true",
+                        help="Force regeneration even if data exists")
     args = parser.parse_args()
-
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
 
     print(f"Cache directory: {CACHE_DIR}")
     print()
 
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
+    if args.regenerate:
+        import shutil
+        if os.path.exists(CACHE_DIR):
+            shutil.rmtree(CACHE_DIR)
+            print("Cleared existing data.")
 
-    # Step 2: Train tokenizer
-    train_tokenizer()
+    generate_and_save_data(num_train=args.num_samples)
     print()
-    print("Done! Ready to train.")
+    print("Done! Ready to run linearizer.py")
