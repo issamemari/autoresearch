@@ -1,15 +1,13 @@
 """
-DPD linearizer — Real-valued neural network DPD.
-Uses a small feedforward NN operating on [|x|, Re(x), Im(x)] features
-with memory taps, trained to minimize PA output error directly.
+DPD linearizer — GMP with ILA, 1 iteration.
+Best-performing approach from previous experiments, now with
+band-limited input signal that has lower ACPR floor.
 
 Usage: uv run linearizer.py
 """
 
 import time
 import numpy as np
-import torch
-import torch.nn as nn
 from prepare import (
     TIME_BUDGET, SAMPLE_RATE, SIGNAL_BANDWIDTH,
     load_data, pa_model, evaluate_dpd, plot_diagnostics,
@@ -20,76 +18,59 @@ from prepare import (
 # Hyperparameters
 # ---------------------------------------------------------------------------
 
-MEMORY_TAPS = 5         # number of memory taps (past samples)
-HIDDEN_SIZE = 64        # NN hidden layer size
-NUM_LAYERS = 3          # NN depth
-LEARNING_RATE = 1e-3
-NUM_EPOCHS = 50
-BATCH_SIZE = 4096
+POLY_ORDER = 7
+MEMORY_DEPTH = 3
+CROSS_ORDER = 5
+CROSS_MEMORY = 2
+CROSS_LAG = 2
+NUM_ITERATIONS = 1
+REGULARIZATION = 1e-6
 
 # ---------------------------------------------------------------------------
-# Neural Network DPD Model
+# GMP Basis Matrix
 # ---------------------------------------------------------------------------
 
-class DPDNN(nn.Module):
-    """Real-valued NN DPD operating on [Re, Im, |x|] features with memory."""
-
-    def __init__(self, memory_taps, hidden_size, num_layers):
-        super().__init__()
-        # Input: for each of (memory_taps+1) taps: [Re(x), Im(x), |x|]
-        input_dim = (memory_taps + 1) * 3
-        layers = []
-        layers.append(nn.Linear(input_dim, hidden_size))
-        layers.append(nn.Tanh())
-        for _ in range(num_layers - 1):
-            layers.append(nn.Linear(hidden_size, hidden_size))
-            layers.append(nn.Tanh())
-        # Output: [Re(y_dpd), Im(y_dpd)]
-        layers.append(nn.Linear(hidden_size, 2))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x_features):
-        return self.net(x_features)
-
-
-def build_features(x, memory_taps):
-    """Build NN input features: [Re(x(n)), Im(x(n)), |x(n)|, ..., Re(x(n-M)), ...]."""
+def build_gmp_basis_matrix(x, K_a, M_a, K_c, M_c, L_c):
     N = len(x)
-    M = memory_taps
-    x_pad = np.concatenate([np.zeros(M, dtype=np.complex128), x])
+    pad = max(M_a, M_c + L_c)
+    x_pad = np.concatenate([np.zeros(pad, dtype=np.complex128), x,
+                            np.zeros(L_c, dtype=np.complex128)])
+    columns = []
 
-    feat_list = []
-    for m in range(M + 1):
-        x_del = x_pad[M - m : N + M - m]
-        feat_list.append(np.real(x_del))
-        feat_list.append(np.imag(x_del))
-        feat_list.append(np.abs(x_del))
+    for k in range(K_a):
+        for m in range(M_a + 1):
+            x_del = x_pad[pad - m : N + pad - m]
+            columns.append(x_del * np.abs(x_del) ** (2 * k))
 
-    return np.column_stack(feat_list)
+    for k in range(1, K_c + 1):
+        for m in range(M_c + 1):
+            for l in range(1, L_c + 1):
+                x_sig = x_pad[pad - m : N + pad - m]
+                x_env = x_pad[pad - m - l : N + pad - m - l]
+                columns.append(x_sig * np.abs(x_env) ** (2 * k))
+
+    for k in range(1, K_c + 1):
+        for m in range(M_c + 1):
+            for l in range(1, L_c + 1):
+                x_sig = x_pad[pad - m : N + pad - m]
+                x_env = x_pad[pad - m + l : N + pad - m + l]
+                columns.append(x_sig * np.abs(x_env) ** (2 * k))
+
+    return np.column_stack(columns)
 
 
-def apply_nn_dpd(x, model, memory_taps, device='cpu'):
-    """Apply the NN DPD to a signal."""
-    features = build_features(x, memory_taps)
-    feat_tensor = torch.tensor(features, dtype=torch.float32, device=device)
-
-    model.eval()
-    with torch.no_grad():
-        out = model(feat_tensor).cpu().numpy()
-
-    return out[:, 0] + 1j * out[:, 1]
-
+def apply_dpd(x, coefficients):
+    K_a = (POLY_ORDER + 1) // 2
+    K_c = (CROSS_ORDER - 1) // 2
+    U = build_gmp_basis_matrix(x, K_a, MEMORY_DEPTH, K_c, CROSS_MEMORY, CROSS_LAG)
+    return U @ coefficients
 
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
 
 t_start = time.time()
-torch.manual_seed(42)
 np.random.seed(42)
-
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-print(f"Device: {device}")
 
 x_train, y_train = load_data("train")
 print(f"Training samples: {len(x_train):,}")
@@ -100,61 +81,49 @@ print(f"PA linear gain: {abs(pa_gain):.4f} (phase: {np.degrees(np.angle(pa_gain)
 nmse_no_dpd = compute_nmse_db(y_train, x_train)
 print(f"PA NMSE (no DPD): {nmse_no_dpd:.2f} dB")
 
+K_a = (POLY_ORDER + 1) // 2
+K_c = (CROSS_ORDER - 1) // 2
+n_aligned = K_a * (MEMORY_DEPTH + 1)
+n_cross = 2 * K_c * (CROSS_MEMORY + 1) * CROSS_LAG
+num_coefficients = n_aligned + n_cross
+print(f"GMP: {n_aligned} aligned + {n_cross} cross = {num_coefficients} coefficients")
+
 # ---------------------------------------------------------------------------
-# Phase 1: Train NN as post-distorter (ILA-style initialization)
+# Training: ILA
 # ---------------------------------------------------------------------------
-# Train NN to map PA_output/G -> PA_input (the post-inverse).
-# Then use it as a pre-distorter.
 
 print()
-print("Phase 1: Training NN post-inverse (ILA init)...")
+print("Training DPD (ILA)...")
 
-# Build training data for post-inverse
-dpd_input = y_train / pa_gain  # normalized PA output
-dpd_target = x_train            # original input
+coefficients = None
 
-features_train = build_features(dpd_input, MEMORY_TAPS)
-targets_re = np.real(dpd_target)
-targets_im = np.imag(dpd_target)
-targets_np = np.column_stack([targets_re, targets_im])
+for iteration in range(NUM_ITERATIONS):
+    t_iter = time.time()
 
-feat_tensor = torch.tensor(features_train, dtype=torch.float32, device=device)
-tgt_tensor = torch.tensor(targets_np, dtype=torch.float32, device=device)
+    if iteration == 0:
+        dpd_input = y_train / pa_gain
+        dpd_target = x_train
+    else:
+        x_dpd = apply_dpd(x_train, coefficients)
+        y_new = pa_model(x_dpd)
+        dpd_input = y_new / pa_gain
+        dpd_target = x_train
 
-model = DPDNN(MEMORY_TAPS, HIDDEN_SIZE, NUM_LAYERS).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    U = build_gmp_basis_matrix(dpd_input, K_a, MEMORY_DEPTH,
+                                K_c, CROSS_MEMORY, CROSS_LAG)
 
-N = len(x_train)
-num_batches = (N + BATCH_SIZE - 1) // BATCH_SIZE
+    A = U.conj().T @ U + REGULARIZATION * np.eye(num_coefficients)
+    b = U.conj().T @ dpd_target
+    coefficients = np.linalg.solve(A, b)
 
-for epoch in range(NUM_EPOCHS):
-    model.train()
-    perm = torch.randperm(N, device=device)
-    epoch_loss = 0.0
+    x_dpd_check = apply_dpd(x_train, coefficients)
+    y_check = pa_model(x_dpd_check)
+    train_nmse = compute_nmse_db(y_check, x_train)
+    train_acpr = compute_acpr_db(y_check)
 
-    for i in range(num_batches):
-        idx = perm[i * BATCH_SIZE : (i + 1) * BATCH_SIZE]
-        feat_batch = feat_tensor[idx]
-        tgt_batch = tgt_tensor[idx]
-
-        pred = model(feat_batch)
-        loss = nn.functional.mse_loss(pred, tgt_batch)
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        epoch_loss += loss.item()
-
-    avg_loss = epoch_loss / num_batches
-
-    if (epoch + 1) % 10 == 0 or epoch == 0:
-        # Evaluate on training set
-        x_dpd_check = apply_nn_dpd(x_train, model, MEMORY_TAPS, device)
-        y_check = pa_model(x_dpd_check)
-        train_nmse = compute_nmse_db(y_check, x_train)
-        train_acpr = compute_acpr_db(y_check)
-        print(f"  Epoch {epoch + 1:3d}/{NUM_EPOCHS}: loss={avg_loss:.6f}  "
-              f"NMSE={train_nmse:.2f} dB  ACPR={train_acpr:.2f} dBc")
+    elapsed = time.time() - t_iter
+    print(f"  Iter {iteration + 1}/{NUM_ITERATIONS}: "
+          f"NMSE={train_nmse:.2f} dB  ACPR={train_acpr:.2f} dBc ({elapsed:.1f}s)")
 
 # ---------------------------------------------------------------------------
 # Evaluation
@@ -163,10 +132,8 @@ for epoch in range(NUM_EPOCHS):
 print()
 print("Evaluating on validation data...")
 
-
 def dpd_fn(x):
-    return apply_nn_dpd(x, model, MEMORY_TAPS, device)
-
+    return apply_dpd(x, coefficients)
 
 results = evaluate_dpd(dpd_fn)
 
@@ -178,7 +145,6 @@ plot_diagnostics(x_val, y_val_nodpd, y_val_dpd, "diagnostics.png")
 
 t_end = time.time()
 
-n_params = sum(p.numel() for p in model.parameters())
 nmse_improvement = results['nmse_no_dpd_db'] - results['nmse_db']
 
 print()
@@ -190,5 +156,5 @@ print(f"acpr_before_dbc:  {results['acpr_before_dbc']:.2f}")
 print(f"acpr_after_dbc:   {results['acpr_after_dbc']:.2f}")
 print(f"evm_before_pct:   {results['evm_before_percent']:.2f}")
 print(f"evm_after_pct:    {results['evm_percent']:.2f}")
-print(f"nn_params:        {n_params}")
+print(f"num_coefficients: {num_coefficients}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
