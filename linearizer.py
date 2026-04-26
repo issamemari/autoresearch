@@ -18,13 +18,14 @@ from prepare import (
 # Hyperparameters
 # ---------------------------------------------------------------------------
 
-POLY_ORDER = 9
-MEMORY_DEPTH = 5
-CROSS_ORDER = 7
-CROSS_MEMORY = 3
-CROSS_LAG = 3
-NUM_ITERATIONS = 1
-REGULARIZATION = 1e-5
+POLY_ORDER = 7
+MEMORY_DEPTH = 3
+CROSS_ORDER = 5
+CROSS_MEMORY = 2
+CROSS_LAG = 2
+NUM_ITERATIONS = 2
+REGULARIZATION = 1e-6
+ILA_DAMPING = 0.5       # mix 50% new + 50% old coefficients
 
 # ---------------------------------------------------------------------------
 # GMP Basis Matrix
@@ -114,7 +115,12 @@ for iteration in range(NUM_ITERATIONS):
 
     A = U.conj().T @ U + REGULARIZATION * np.eye(num_coefficients)
     b = U.conj().T @ dpd_target
-    coefficients = np.linalg.solve(A, b)
+    new_coefficients = np.linalg.solve(A, b)
+
+    if coefficients is None:
+        coefficients = new_coefficients
+    else:
+        coefficients = (1 - ILA_DAMPING) * coefficients + ILA_DAMPING * new_coefficients
 
     x_dpd_check = apply_dpd(x_train, coefficients)
     y_check = pa_model(x_dpd_check)
