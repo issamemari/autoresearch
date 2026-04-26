@@ -25,7 +25,7 @@ CROSS_MEMORY = 2
 CROSS_LAG = 2
 NUM_ITERATIONS = 1
 REGULARIZATION = 1e-6
-DPD_FILTER_BW = 3.0     # DPD output filter bandwidth as multiple of signal BW
+DPD_FILTER_BW = 5.0     # DPD output filter bandwidth as multiple of signal BW
 
 # ---------------------------------------------------------------------------
 # GMP Basis Matrix
@@ -65,7 +65,7 @@ def _bandlimit_filter(x, bw_mult):
     from scipy.signal import firwin, lfilter
     cutoff = bw_mult * SIGNAL_BANDWIDTH / SAMPLE_RATE
     cutoff = min(cutoff, 0.99)  # stay below Nyquist
-    num_taps = 51
+    num_taps = 101
     filt = firwin(num_taps, cutoff, window='hamming')
     filtered = lfilter(filt, 1.0, x)
     # Compensate group delay
