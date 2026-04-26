@@ -18,13 +18,13 @@ from prepare import (
 # Hyperparameters
 # ---------------------------------------------------------------------------
 
-POLY_ORDER = 7
-MEMORY_DEPTH = 3
-CROSS_ORDER = 5
-CROSS_MEMORY = 2
-CROSS_LAG = 2
+POLY_ORDER = 9
+MEMORY_DEPTH = 5
+CROSS_ORDER = 7
+CROSS_MEMORY = 3
+CROSS_LAG = 3
 NUM_ITERATIONS = 1
-REGULARIZATION = 1e-6
+REGULARIZATION = 1e-5
 
 # ---------------------------------------------------------------------------
 # GMP Basis Matrix
