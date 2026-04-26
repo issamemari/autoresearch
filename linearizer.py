@@ -18,8 +18,8 @@ from prepare import (
 # Hyperparameters
 # ---------------------------------------------------------------------------
 
-POLY_ORDER = 9
-MEMORY_DEPTH = 4
+POLY_ORDER = 7
+MEMORY_DEPTH = 3
 CROSS_ORDER = 5
 CROSS_MEMORY = 2
 CROSS_LAG = 2
