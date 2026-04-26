@@ -25,7 +25,7 @@ POLY_ORDER = 7          # maximum polynomial order (odd orders: 1, 3, 5, 7)
 MEMORY_DEPTH = 3        # number of memory taps (0 = memoryless DPD)
 
 # Estimation
-NUM_ITERATIONS = 3      # indirect learning architecture iterations
+NUM_ITERATIONS = 1      # indirect learning architecture iterations
 REGULARIZATION = 1e-6   # ridge regularization for least squares
 
 # ---------------------------------------------------------------------------
